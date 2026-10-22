@@ -32,6 +32,25 @@ cat /sys/class/udc/*/state     # 期望: configured
 
 ## 安装
 
+宿主仓库根有一条 `update_rkwhl.sh`，它同时驱动四个 SDK 和两个卡片插件包。
+**首选跑它**，别手动 pip：
+
+```bash
+cd <wdnwebui>
+./update_rkwhl.sh                       # 按 git HEAD 决定哪些要重装
+UPDATE_RKWHL_FORCE_REBUILD=1 ./update_rkwhl.sh   # 强制全部重装
+```
+
+本包排在 `wdnhid` / `wdnav` **之后**处理——usb_hid 卡 import 这两个 SDK，
+先有它们再装插件，日志里的报错才不会指向"还没装的 SDK"这种假线索。
+
+脚本装完会跑卡片注册校验（`scripts/check_plugin_entrypoints.py`），确认
+`"usb-hid"` 这个 entry point 能解析到卡片目录、manifest `"id"` 逐字相同、
+且 `static/` 存在。这挡的是那个静默失败：pip 全程报成功，宿主启动却把
+这张卡 FATAL 跳过。
+
+手工装也可以：
+
 ```bash
 cd <wdnwebui>/.venv/src
 git clone git@10.10.10.10:wardner/wdnapps_hdmi_processor.git
