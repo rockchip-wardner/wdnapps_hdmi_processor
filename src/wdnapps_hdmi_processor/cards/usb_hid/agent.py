@@ -23,16 +23,16 @@ RPC server，只做 ``{prompt, attachments, options}`` 的搬运，模型返回
 * 同一份 RKNN 可以挂多个 capability，action 语义必须跟着**调用方**
   走，不能焊在模型里。
 
-**为什么单独开一个 swcap 而不是复用 swcap_video_describe。**
+**为什么单独开一个 swcap 而不是复用 swcap_vision_chat。**
 ``get_session`` 命中多实例时取「本机优先 + 卡号升序」的第一个
-（``registry.py::get_session``），而 ``swcap_video_describe`` 同时被
+（``registry.py::get_session``），而 ``swcap_vision_chat`` 同时被
 qwen3-vl-4b 和 qwen3.5-vl-4b 声明 —— 电脑控制拿到哪个模型取决于卡号
-排列，用户完全不可控。``swcap_computer_control`` 只挂在 qwen3.5-vl-4b
+排列，用户完全不可控。``swcap_tool_call`` 只挂在 qwen3.5-vl-4b
 上，取到的永远是那一个（见该卡
 ``app/core/compute/workers/qwen3.5-vl-4b.json``）。
 
 **为什么不调 ``sess.reset()``。** qwen3.5-vl-4b 这个实例同时挂着
-``swcap_text_chat``（微信对话）和 ``swcap_computer_control``。每轮
+``swcap_text_chat``（微信对话）和 ``swcap_tool_call``。每轮
 prompt 都是自包含的（任务 + 已执行动作 + 当前截图），不依赖 worker
 侧的会话历史，所以不需要 reset —— 而且不该调：那会把并发的微信
 对话历史一起清掉。
@@ -80,10 +80,27 @@ LOG = logging.getLogger("apps.usb_hid.agent")
 # --------------------------------------------------------------------------- #
 # Capability / defaults
 # --------------------------------------------------------------------------- #
-#: 唯一声明了本能力的 worker manifest（qwen3.5-vl-4b）。找不到 running
-#: 实例时 ``get_session`` 抛 ``RuntimeError("功能未启用: ...")``，由
-#: HTTP 层按 AGENTS.md 设计原则 4 透传给前端。
-CAPABILITY = "swcap_computer_control"
+#: 本 agent 需要的**能力组** —— 组内两项必须由**同一个**模型实例同时
+#: 满足：截图要视觉（``swcap_vision_chat``），动作要可执行输出
+#: （``swcap_tool_call``）。当前只有 qwen3.5-vl-4b 同时具备这两项。
+#:
+#: 以前这里是单个 ``CAPABILITY = "swcap_computer_control"``，本质是**绑定
+#: 伪装成能力** —— 它存在的唯一理由是 ``swcap_video_describe`` 有两个
+#: provider（qwen3-vl-4b / qwen3.5-vl-4b），而 ``get_session`` 命中多个
+#: 实例时取「本机优先 + 卡号升序」的第一个，电脑控制拿到哪个模型取决于
+#: 卡号排列，用户不可控（见本文件顶部「为什么单独开一个 swcap」）。
+#: 现在能力与绑定解耦：能力如实声明「要视觉 + 要工具调用」，
+#: 「必须同一个模型」由向导的 group 绑定与下面的组内校验共同保证。
+#:
+#: 找不到 running 实例时 ``get_session`` 抛
+#: ``RuntimeError("功能未启用: ...")``，由 HTTP 层按 AGENTS.md
+#: 设计原则 4 透传给前端。
+CAPABILITIES: tuple[str, ...] = (
+    "swcap_vision_chat",
+    "swcap_tool_call",
+)
+#: 兼容旧调用点：拿「主」能力（工具调用 —— 本卡区别于普通视觉描述的那一项）。
+CAPABILITY = CAPABILITIES[-1]
 
 DEFAULT_MAX_STEPS = 12
 HARD_MAX_STEPS = 60
@@ -599,6 +616,7 @@ class ComputerControlAgent:
                 "elapsed_s": round(elapsed, 1),
                 "host_screen": [HOST_SCREEN_W, HOST_SCREEN_H],
                 "capability": CAPABILITY,
+                "capabilities": list(CAPABILITIES),
             }
 
     # -- loop ---------------------------------------------------------- #
@@ -616,8 +634,10 @@ class ComputerControlAgent:
 
     def _loop(self) -> None:
         # Fail fast on "模型没开" before touching the PC at all — the
-        # whole point of the swcap is that this is a clean, explainable
-        # failure, not a mystery timeout on step 1.
+        # whole point of the capability group is that this is a clean,
+        # explainable failure, not a mystery timeout on step 1 (which is
+        # what you'd get from a text-only tool-call model that turns out
+        # to have no vision tower).
         session = self._get_session()
 
         last_sig: Optional[tuple] = None
@@ -735,9 +755,31 @@ class ComputerControlAgent:
     # -- model --------------------------------------------------------- #
     def _get_session(self):
         from app.core.compute.registry import get_registry
-        # RuntimeError("功能未启用: swcap_computer_control") 冒泡到 HTTP
-        # 层变成 502 —— 前端能直接看到该去算力配置里开哪个模型。
-        return get_registry().get_session(CAPABILITY)
+        reg = get_registry()
+        # 先按**组**校验：两个实例各满足一半（一个能看图、一个能出动作）到
+        # 这里是有可能出现的，只查单个能力会漏过去，直到第一次送图才炸
+        # 「不支持图片」。组校验失败 → RuntimeError("功能未启用: ...")
+        # 冒泡到 HTTP 层变成 502 —— 前端能直接看到该去算力配置里开哪个模型。
+        if len(CAPABILITIES) > 1:
+            handles = reg.list_sessions(CAPABILITIES[0], include_remote=True)
+            if not handles:
+                raise RuntimeError(f"功能未启用: {CAPABILITIES[0]}")
+            caps = set()
+            for h in handles:
+                inst = next(
+                    (i for i in reg.list_with_source()
+                     if i.get("model_id") == h.model_id
+                     and i.get("npu_index") == h.npu_index),
+                    None,
+                )
+                if inst:
+                    caps.update(inst.get("capability_types") or [])
+            if not set(CAPABILITIES).issubset(caps):
+                raise RuntimeError(
+                    "功能未启用: 需要同一个模型同时满足 "
+                    + " + ".join(CAPABILITIES)
+                )
+        return reg.get_session(CAPABILITY)
 
     def _ask_model(self, session, frame, step_idx: int):
         """One VLM turn.
@@ -815,7 +857,8 @@ class ComputerControlAgent:
             from app.core.llm.detector_base import _pick_letterbox_size
             sizes: list[int] = []
             for inst in get_registry().list_with_source():
-                if CAPABILITY not in (inst.get("capability_types") or []):
+                if not set(CAPABILITIES).issubset(
+                        set(inst.get("capability_types") or [])):
                     continue
                 # ``list_with_source`` also emits an ``unavailable``
                 # placeholder for every not-running model, and it

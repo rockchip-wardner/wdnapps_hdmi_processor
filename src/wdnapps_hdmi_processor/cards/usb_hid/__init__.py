@@ -21,7 +21,7 @@ Why a dedicated card instead of bolting this onto ``tools``:
 * Wizard shape is fundamentally different (canvas + keystroke sandbox,
   not model selection).
 * Capability model: the manual-control half needs no model, but the
-  AI-control half consumes ``swcap_computer_control``
+  AI-control half consumes ``swcap_tool_call``
   (qwen3.5-vl-4b). Without it, ``get_session`` raises and
   ``POST /task/start`` answers 502 — the manual half is unaffected.
 """

@@ -35,7 +35,7 @@ Endpoint summary
                                             background thread. 409 when
                                             one is already running, 502
                                             when
-                                            ``swcap_computer_control``
+                                            ``swcap_tool_call``
                                             has no instance, 503 when
                                             hwcap_hdmiin is off.
 * ``POST /api/usb-hid/task/stop``        — stop the loop, release the
@@ -533,7 +533,7 @@ async def post_task_start(payload: _TaskStart) -> dict[str, Any]:
     has nothing to look at, and letting it start would only produce a
     confusing failure on step 1.
 
-    502 when ``swcap_computer_control`` has no running instance. Per
+    502 when ``swcap_tool_call`` has no running instance. Per
     AGENTS.md 设计原则 4 the registry raises
     ``RuntimeError("功能未启用: ...")``; it is translated here into the
     same 502 the other cards use so the frontend renders one uniform
