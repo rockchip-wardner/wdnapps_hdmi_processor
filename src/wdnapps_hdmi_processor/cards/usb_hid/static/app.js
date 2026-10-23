@@ -566,6 +566,38 @@
       // （离开时的 sendBeacon 只是 best-effort，浏览器可能丢掉）。
       // 同步拉一次，有任务就接着轮询，没有就把 UI 归位。
       this.syncTask();
+      // 所需能力（视觉 + 工具调用必须同一模型）未启用时置灰，避免用户
+      // 点了才拿到 502。页面可见时每 5s 复查，去算力页启用后自动恢复。
+      this._refreshCapability().catch(() => {});
+      if (!this._capTimer) {
+        this._capTimer = setInterval(() => {
+          if (document.visibilityState !== "visible") return;
+          this._refreshCapability().catch(() => {});
+        }, 5000);
+      }
+    },
+
+    async _refreshCapability() {
+      try {
+        const r = await fetch(API_PREFIX + "/compute/instances-by-capability"
+          + "?capability=swcap_vision_chat&capability=swcap_tool_call",
+          { cache: "no-store" });
+        if (!r.ok) return;
+        const d = await r.json();
+        this._capReady = Array.isArray(d.instances) && d.instances.length > 0;
+      } catch (_e) {
+        return;
+      }
+      this._applyTaskButtonState();
+    },
+
+    _applyTaskButtonState() {
+      if (!this.taskStartBtn) return;
+      const blocked = this._capReady === false;
+      this.taskStartBtn.disabled = blocked || this._taskRunning === true;
+      this.taskStartBtn.title = blocked
+        ? "功能未启用：请先在算力配置启用 [VLLM] 视觉文字多模态模型"
+        : "";
     },
 
     async syncTask() {
@@ -577,6 +609,11 @@
     },
 
     async startTask() {
+      if (this._capReady === false) {
+        this.setTaskStatus(
+          "功能未启用：请先在算力配置启用 [VLLM] 视觉文字多模态模型", true);
+        return;
+      }
       const task = (this.taskInput?.value || "").trim();
       if (!task) {
         this.setTaskStatus("请先填写要让 AI 完成的任务。", true);
@@ -658,6 +695,7 @@
       if (window.DemoGuard) window.DemoGuard.report("usb-hid", snap);
 
       const running = !!snap.running;
+      this._taskRunning = running;
       if (this.taskBadge) {
         this.taskBadge.hidden = !running;
         this.taskBadge.textContent = "运行中";
@@ -668,7 +706,7 @@
           ? `第 ${snap.step_count}/${snap.max_steps} 步 · ${snap.elapsed_s}s`
           : "—";
       }
-      if (this.taskStartBtn) this.taskStartBtn.disabled = running;
+      this._applyTaskButtonState();
       if (this.taskStopBtn) this.taskStopBtn.disabled = !running;
 
       this.renderTaskLog(snap.steps || []);
@@ -676,7 +714,8 @@
     },
 
     applyTaskIdle(snap) {
-      if (this.taskStartBtn) this.taskStartBtn.disabled = false;
+      this._taskRunning = false;
+      this._applyTaskButtonState();
       if (this.taskStopBtn) this.taskStopBtn.disabled = true;
       if (snap.state === "done") this.setTaskStatus("任务已完成。", false);
       else if (snap.state === "stopped") this.setTaskStatus("已停止。", false);
