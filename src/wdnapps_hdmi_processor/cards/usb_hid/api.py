@@ -318,9 +318,11 @@ async def post_hdmiin_restart() -> dict[str, Any]:
 async def get_hdmiin_snapshot() -> Response:
     """Return the most recent HDMI-IN frame as a JPEG.
 
-    The frame is encoded once per V4L2 dequeue (target ~10 fps) by
-    :class:`HdmiInCapture`; this endpoint just returns the cached
-    bytes. Cheap enough to poll at 1~2 Hz from the page.
+    The frame is encoded once per V4L2 dequeue (throttled to
+    ``target_fps = 30``) by :class:`HdmiInCapture`, at the capture's
+    **native** resolution (1920x1080 on this board) — the page tile is
+    wider than 1280, so a smaller preview would be upscaled by the
+    browser and look soft. This endpoint just returns the cached bytes.
 
     Returns 503 if ``hwcap_hdmiin`` is disabled; 204 if no frame
     has been captured yet; 200 with the JPEG on success.

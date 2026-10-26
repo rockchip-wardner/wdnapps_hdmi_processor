@@ -401,11 +401,18 @@
       // we can never paint.
       //
       // The delay between ticks is what sets the ceiling, and it is NOT
-      // a server-side limit: the backend serves a 272 KB 720p JPEG in
-      // ~2.3 ms and answers ~70 pulls/second on loopback. The capture
-      // thread, with `target_fps = 30`, produces 30 distinct frames per
-      // second. The old hard 120 ms (≈8 fps) was the actual bottleneck
-      // and the reason the preview felt like a slideshow.
+      // a server-side limit: the backend serves a ~82 KB 1920x1080
+      // JPEG in ~2.3 ms and answers ~70 pulls/second on loopback. The
+      // capture thread, with `target_fps = 30`, produces 30 distinct
+      // frames per second. The old hard 120 ms (≈8 fps) was the actual
+      // bottleneck and the reason the preview felt like a slideshow.
+      //
+      // The preview is served at the capture's **native** resolution:
+      // the tile is wider than 1280, so a 720p preview would be
+      // upscaled by the browser and look soft (measured: 57% of the
+      // reference sharpness at a 1920 px display width, vs 102% at
+      // 1080p). `WDNWEBUI_HDMIIN_PREVIEW_SIZE` can shrink it when
+      // bandwidth matters more than sharpness.
       //
       // Default 24 ms ≈ 30 fps serial ceiling, which matches the
       // source exactly: faster than that just pulls duplicate frames
