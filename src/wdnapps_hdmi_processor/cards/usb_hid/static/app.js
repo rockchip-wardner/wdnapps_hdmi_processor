@@ -493,6 +493,16 @@
         line.style.color = "#1abc54";
       } else {
         banner.classList.remove("hidden");
+        // 内核压根不支持 USB HID gadget 时，"跑 sudo setup 脚本"是
+        // 无效建议 —— 脚本会死在 `mkdir functions/hid.usb0`（ENOENT，
+        // 因为 configfs 里没有 hid 这个 function 类型）。说实话。
+        if (snap.supported === false) {
+          reason.textContent = snap.unsupported_reason
+            || "本机内核不支持 USB HID gadget";
+          line.textContent = "内核不支持";
+          line.style.color = "#e74c3c";
+          return;
+        }
         const missing = [];
         if (!snap.devices.keyboard.exists) missing.push("/dev/hidg0 不存在");
         else if (!snap.devices.keyboard.writable) missing.push("/dev/hidg0 不可写");

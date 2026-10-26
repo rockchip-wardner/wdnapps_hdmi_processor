@@ -174,6 +174,11 @@ async def get_snapshot() -> dict[str, Any]:
     Always 200. Missing/wrong-perm chardevs show up as ``writable=false``
     — the frontend renders a banner pointing the operator at
     ``scripts/setup_usb_hid_gadget.sh``.
+
+    But that advice is only valid when the kernel *can* do the HID
+    gadget.  ``supported`` reports whether it can; when it can't, the
+    banner says so instead of sending the operator into a setup script
+    that dies at ``mkdir functions/hid.usb0`` with ENOENT.
     """
     status = manager.gadget_status()
     # Surface a coarse "ready" bit for the frontend's traffic light.
@@ -184,6 +189,21 @@ async def get_snapshot() -> dict[str, Any]:
         and kbd["exists"] and kbd["writable"]
         and dig["exists"] and dig["writable"]
     )
+    ks = status.get("kernel_support") or {}
+    # None means "could not determine" — don't claim it's unsupported
+    # just because the probe couldn't read the kernel config.
+    status["supported"] = bool(ks.get("hidg")) and bool(ks.get("configfs_f_hid"))
+    if not status["supported"]:
+        lacking = []
+        if ks.get("configfs_f_hid") is False:
+            lacking.append("CONFIG_USB_CONFIGFS_F_HID")
+        if ks.get("hidg") is False:
+            lacking.append("hidg 驱动 (CONFIG_USB_HIDG)")
+        status["unsupported_reason"] = (
+            "本机内核未启用 USB HID gadget（缺 "
+            + ("、".join(lacking) if lacking else "HID gadget 支持")
+            + "）—— 需要换 BSP / 重编内核；sudo setup 脚本在这台机器上跑不通"
+        )
     return status
 
 
