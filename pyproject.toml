@@ -25,6 +25,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7", "build>=1.0"]
 
+[project.urls]
+Homepage = "https://github.com/rockchip-wardner/wdnapps_hdmi_processor"
+Repository = "https://github.com/rockchip-wardner/wdnapps_hdmi_processor"
+Issues = "https://github.com/rockchip-wardner/wdnapps_hdmi_processor/issues"
+
 [project.entry-points."wdnwebui.cards"]
 "usb-hid" = "wdnapps_hdmi_processor.cards.usb_hid"
 

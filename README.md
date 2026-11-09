@@ -53,7 +53,7 @@ UPDATE_RKWHL_FORCE_REBUILD=1 ./update_rkwhl.sh   # 强制全部重装
 
 ```bash
 cd <wdnwebui>/.venv/src
-git clone git@10.10.10.10:wardner/wdnapps_hdmi_processor.git
+git clone git@github.com:rockchip-wardner/wdnapps_hdmi_processor.git
 pip install -e wdnapps_hdmi_processor
 ```
 
