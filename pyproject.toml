@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wdnapps-hdmi-processor"
-version = "0.1.0"
+version = "0.1.1"
 description = "wdnwebui HDMI / 电脑外设类应用插件：智能电脑控制（HDMI-IN 抓帧 + USB HID 注入）"
 readme = "README.md"
 requires-python = ">=3.9"
