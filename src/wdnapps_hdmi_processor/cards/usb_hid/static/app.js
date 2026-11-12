@@ -590,6 +590,18 @@
         this._capTimer = setInterval(() => {
           if (document.visibilityState !== "visible") return;
           this._refreshCapability().catch(() => {});
+          // HDMI-IN 探测必须**周期重试** —— 它是「启动采集」的唯一触发点，
+          // 而探测的 ok 会因为两个窗口短暂为 false：
+          //   * read_hdmi_link() 读到 "disconnected" —— 服务重启后
+          //     rk_hdmirx 重新协商 HDMI 链路期间会这样；
+          //   * _capture_state() == "starting" —— 设备已打开但格式还没发布。
+          // init() 只探测两次（refreshHdmiin + refresh→refreshHdmiin），
+          // 两次都落在坏窗口里就永远起不来：没有任何定时器再试，预览
+          // 一直停在「未连接 HDMI-IN」占位图。实测就是服务 reload 之后
+          // 打开这个卡片页复现的 —— 采集一次都没起过（服务端日志里没有
+          // "hdmiin capture started"），而 /source/hdmiin/open 从未被调用。
+          // 有了这个重试，坏窗口最多拖 5 秒就自愈，不用用户手动刷新。
+          this.refreshHdmiin().catch(() => {});
         }, 5000);
       }
     },
