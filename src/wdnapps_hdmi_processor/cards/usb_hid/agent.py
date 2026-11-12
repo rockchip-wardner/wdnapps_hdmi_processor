@@ -118,6 +118,50 @@ TAP_HOLD_MS = 60.0
 SCREENSHOT_TIMEOUT_S = 6.0
 #: 连续多少次**完全相同**的动作后判定卡死。
 REPEAT_LIMIT = 3
+#: 单步推理的输出 token 上限。这一步要的是一个动作 JSON，实测几百 token
+#: 以内就够。
+#:
+#: 为什么必须显式压：Qwen3.5-VL-9B 的 spec 默认 ``max_new_tokens=13312``
+#: （= ``max_context_len // 8``，模型厂家给自由对话的建议）。那个数字对
+#: **schema 约束**的输出是 40 倍超配 —— 而 9B 的解码是 ``top_k=1`` 的贪心
+#: 路径（见 wdnai ``backends/_qwen35_vl_9b_vendor.py`` 里硬编码的 llm_args），
+#: 一旦模型复读就永远不会吐 EOS，会一路烧到 13312 token，把 worker 的
+#: 60 s 推理预算耗光。更糟的是 worker 超时后**推理线程是 daemon、只被
+#: 弃用不被打断**（wdnwebui ``app/core/compute/workers/_base.py`` 的
+#: ``_serve_one`` 注释里写明了这一点），NPU 就一直被占着 —— 后面每一次
+#: 推理都排队等死，用户看到的现象是"老是推理错误"，直到手动重启实例。
+#:
+#: 压到 512 就是把"卡死 NPU 几分钟"变成"十几秒内自己收工"。
+_MAX_NEW_TOKENS = 512
+
+
+class _ModelUnavailable(RuntimeError):
+    """模型这一会儿不可用，但它会自己回来。
+
+    两种情况都不是「模型不行」，而是「现在问不到」：
+
+    * ``inference exceeded Ns`` —— worker 的推理预算被烧光了。worker 超时
+      时**不会打断**那次推理（推理线程是 daemon，只是被弃用），NPU 会一直被
+      占着，直到驱动自己返回。注册表这时会把这个 worker 重启（见
+      ``app/core/compute/registry.py`` 的 ``recover_wedged_instance``），
+      换一个新的 worker 重新加载模型 —— 本机上大约要 50 秒。
+    * ``session is closed`` —— worker 已经在我们脚下被重启了，手里这个
+      会话句柄作废了。
+
+    这两种都等得起，所以循环会等模型回来再重试这一步，而不是把整个任务
+    直接判死。
+    """
+
+
+def _is_recoverable_model_error(exc: BaseException) -> bool:
+    """这个错误是「等一会儿就好」，还是「真的不行」？
+
+    只认 worker 自己给的那两种说法（它们的原文就是 ``TimeoutError:
+    inference exceeded 60.0s`` 和 ``session is closed``）—— RPC 边界上
+    异常类型过不来，字符串是唯一可靠的标记。
+    """
+    text = str(exc)
+    return ("inference exceeded" in text) or ("session is closed" in text)
 
 #: PC 虚拟桌面尺寸。跟 ``api.py`` 的 ``_HOST_GRID_W/_HOST_GRID_H`` 必须
 #: 一致 —— 手动透传和 AI 规划走的是同一个 HID 数字板坐标系。
@@ -673,7 +717,22 @@ class ComputerControlAgent:
             if self._cancel.is_set():
                 return self._finish("stopped")
 
-            action, why = self._ask_model(session, frame, i)
+            try:
+                action, why = self._ask_model(session, frame, i)
+            except _ModelUnavailable as e:
+                # 模型暂时不可用（worker 被重启 / 推理预算烧光）。等它回来
+                # 再重试这一步 —— 这一步的动作**还没下发到电脑**，重做是安全
+                # 的，比把整个任务判死强得多。
+                LOG.warning("agent step %d: 模型暂时不可用（%s）—— 等它回来重试", i, e)
+                try:
+                    session = self._await_session()
+                except Exception as e2:  # noqa: BLE001
+                    return self._fail(
+                        f"模型 worker 重启后没能恢复：{e2}")
+                try:
+                    action, why = self._ask_model(session, frame, i)
+                except _ModelUnavailable as e3:
+                    return self._fail(f"第 {i} 步模型推理失败：{e3}")
             if self._cancel.is_set():
                 return self._finish("stopped")
             if action is None:
@@ -783,6 +842,27 @@ class ComputerControlAgent:
                 )
         return reg.get_session(CAPABILITY)
 
+    def _await_session(self, timeout_s: float = 120.0):
+        """等一个可用的会话重新出现。
+
+        worker 被重启后，换上来的那个要重新加载模型（本机上大约 50 秒），
+        这段时间里注册表里没有 running 实例，``get_session`` 会抛
+        "功能未启用"。轮询等它回来，而不是让整个任务因为一次超时死掉。
+
+        顺带解决「会话句柄作废」：worker 换人之后旧句柄是关着的，重新
+        拿一个才是对的。
+        """
+        deadline = time.monotonic() + timeout_s
+        last = ""
+        while True:
+            try:
+                return self._get_session()
+            except Exception as e:  # noqa: BLE001
+                last = str(e)
+            if time.monotonic() >= deadline:
+                raise RuntimeError(last or "模型实例没有恢复")
+            time.sleep(2.0)
+
     def _ask_model(self, session, frame, step_idx: int):
         """One VLM turn.
 
@@ -815,11 +895,26 @@ class ComputerControlAgent:
             # 否则 backend 会自作主张选另一个 vision 变体，0-1000 坐标
             # 空间就和 meta 对不上（见 detector_base 里的同一段注释）。
             #
-            # ``enable_thinking=True`` 打开模型的推理模式：它会先吐一段
-            # ``<think>…</think>`` 再给 JSON。调试期间这是最有价值的一段
-            # 信息 —— 上一轮 9 个成功步骤的 ``thought`` **全是空的**，
-            # 动作序列又明显偏离任务（跳过了"开始菜单 → notepad → 回车"
-            # 整段），没有推理链就只能靠猜它在干什么。
+            # ``enable_thinking=False``：9B 的 chat template 是空的
+            # （gguf 里没有 thinking 模板），而且 RKNN 会话**默认就是
+            # thinking 模式**（见 wdnwebui app/core/compute/workers/_base.py
+            # 的 set_thinking_mode_handler 注释）。开着 thinking 时 prompt
+            # 尾部会多一个**没闭合**的 ``<think>``，模型被推进"还在想"的
+            # 状态里 —— 实测 9B 在这个模式下**一次都没吐过 think 链**
+            # （每一步的 thinking 都是空的），却要多付 3 倍时间
+            # （同一条提示：thinking 开 4.9 s / 关 1.6 s），而且贪心解码
+            # 容易在"未闭合 think"里复读到天荒地老。关掉它，模型直接给
+            # JSON，thinking 段自然为空（agent 本来就把空 thinking 当正常
+            # 情况处理，见 _extract_thinking 的调用点）。
+            #
+            # ``max_new_tokens=512``：这一步要的是一个动作 JSON，实测几百
+            # token 以内。9B 的 spec 默认是 13312（= max_context_len // 8，
+            # 模型厂家的建议），对 schema 约束的输出来说是 40 倍超配 ——
+            # 模型一旦复读不吐 EOS，就要一路烧到 13312 token，把 worker
+            # 的 60 s 推理预算耗光（然后 NPU 被占住，后面每次推理都跟着
+            # 超时）。压到 512 就是把"卡死 NPU 几分钟"变成"十几秒内自己
+            # 收工"。这个 override 会随 RPC 的 options 字段一路传到
+            # wdnai 多卡后端的 ``_generate(max_new_tokens=…)``。
             #
             # ``on_delta`` 用来把**原始文本**收回来：``respond`` 在
             # ``_parse_output`` 里会把 think 块 strip 掉
@@ -834,10 +929,15 @@ class ComputerControlAgent:
                 attachment=[Attachment(canvas)],
                 generating=AgentAction,
                 image_size=target,
-                enable_thinking=True,
+                enable_thinking=False,
+                max_new_tokens=_MAX_NEW_TOKENS,
                 on_delta=stream.append,
             ))
         except Exception as e:  # noqa: BLE001
+            if _is_recoverable_model_error(e):
+                # 不是「这次推理不行」，是「模型这一会儿不可用」—— 交给
+                # 循环去等它回来（见 _loop 里的重试）。
+                raise _ModelUnavailable(str(e)) from e
             LOG.warning("agent step %d: respond failed: %s", step_idx, e)
             return None, f"第 {step_idx} 步模型推理失败：{e}"
 
