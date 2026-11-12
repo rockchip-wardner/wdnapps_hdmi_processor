@@ -2,8 +2,8 @@
   "enabled": true,
   "wizard_title": "智能电脑控制 — 快速配置",
   "swcap_to_model": {
-    "swcap_vision_chat": { "npu_index": 0, "model_id": "qwen3.5-vl-4b", "group": "agent" },
-    "swcap_tool_call":   { "npu_index": 0, "model_id": "qwen3.5-vl-4b", "group": "agent" }
+    "swcap_vision_chat": { "npu_index": [0, 1], "model_id": "qwen3.5-vl-9b", "group": "agent" },
+    "swcap_tool_call":   { "npu_index": [0, 1], "model_id": "qwen3.5-vl-9b", "group": "agent" }
   },
   "start_buttons": [],
   "steps": [

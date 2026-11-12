@@ -26,15 +26,15 @@ RPC server，只做 ``{prompt, attachments, options}`` 的搬运，模型返回
 **为什么单独开一个 swcap 而不是复用 swcap_vision_chat。**
 ``get_session`` 命中多实例时取「本机优先 + 卡号升序」的第一个
 （``registry.py::get_session``），而 ``swcap_vision_chat`` 同时被
-qwen3-vl-4b 和 qwen3.5-vl-4b 声明 —— 电脑控制拿到哪个模型取决于卡号
-排列，用户完全不可控。``swcap_tool_call`` 只挂在 qwen3.5-vl-4b
-上，取到的永远是那一个（见该卡
-``app/core/compute/workers/qwen3.5-vl-4b.json``）。
+qwen3-vl-4b / qwen3.5-vl-4b / qwen3.5-vl-9b 声明 —— 电脑控制拿到哪个模型
+取决于卡号排列，用户完全不可控。``swcap_tool_call`` 只挂在
+qwen3.5-vl-4b 和 qwen3.5-vl-9b 上（见这两个模型的 worker manifest）。
 
-**为什么不调 ``sess.reset()``。** qwen3.5-vl-4b 这个实例同时挂着
-``swcap_text_chat``（微信对话）和 ``swcap_tool_call``。每轮
+**为什么不调 ``sess.reset()``。** 承载本卡的实例（qwen3.5-vl-4b 或
+qwen3.5-vl-9b）同时挂着 ``swcap_text_chat``（文本对话）和
+``swcap_tool_call``。每轮
 prompt 都是自包含的（任务 + 已执行动作 + 当前截图），不依赖 worker
-侧的会话历史，所以不需要 reset —— 而且不该调：那会把并发的微信
+侧的会话历史，所以不需要 reset —— 而且不该调：那会把并发的文本
 对话历史一起清掉。
 
 坐标的三次空间
@@ -82,7 +82,9 @@ LOG = logging.getLogger("apps.usb_hid.agent")
 # --------------------------------------------------------------------------- #
 #: 本 agent 需要的**能力组** —— 组内两项必须由**同一个**模型实例同时
 #: 满足：截图要视觉（``swcap_vision_chat``），动作要可执行输出
-#: （``swcap_tool_call``）。当前只有 qwen3.5-vl-4b 同时具备这两项。
+#: （``swcap_tool_call``）。qwen3.5-vl-4b 与 qwen3.5-vl-9b 都同时具备这两项；
+#: 卡片自己的向导（``static/wizard.json``）把 group 绑到其中**一个**上，
+#: 绑哪个由那张卡的 ``swcap_to_model`` 决定 —— 能力组只保证「同一个模型」。
 #:
 #: 以前这里是单个 ``CAPABILITY = "swcap_computer_control"``，本质是**绑定
 #: 伪装成能力** —— 它存在的唯一理由是 ``swcap_video_describe`` 有两个
