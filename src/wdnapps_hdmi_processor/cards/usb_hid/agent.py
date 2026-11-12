@@ -895,17 +895,18 @@ class ComputerControlAgent:
             # 否则 backend 会自作主张选另一个 vision 变体，0-1000 坐标
             # 空间就和 meta 对不上（见 detector_base 里的同一段注释）。
             #
-            # ``enable_thinking=False``：9B 的 chat template 是空的
-            # （gguf 里没有 thinking 模板），而且 RKNN 会话**默认就是
-            # thinking 模式**（见 wdnwebui app/core/compute/workers/_base.py
-            # 的 set_thinking_mode_handler 注释）。开着 thinking 时 prompt
-            # 尾部会多一个**没闭合**的 ``<think>``，模型被推进"还在想"的
-            # 状态里 —— 实测 9B 在这个模式下**一次都没吐过 think 链**
-            # （每一步的 thinking 都是空的），却要多付 3 倍时间
-            # （同一条提示：thinking 开 4.9 s / 关 1.6 s），而且贪心解码
-            # 容易在"未闭合 think"里复读到天荒地老。关掉它，模型直接给
-            # JSON，thinking 段自然为空（agent 本来就把空 thinking 当正常
-            # 情况处理，见 _extract_thinking 的调用点）。
+            # ``enable_thinking=False``：Qwen3.5 开思考有概率陷入**死循环**
+            # （贪心解码在未闭合的 think 块里复读、不吐 EOS，把 worker 的
+            # 60 s 推理预算烧光，NPU 被占住 → 后面每个请求都跟着超时）。
+            # 宿主应用层（wdnwebui ``app/core/thinking.py``）已经把思考
+            # **全局关掉**，这里只是把意图写明确。
+            #
+            # ⚠️ **注意：真·非思考模式下 9B 会复读 JSON Schema 外壳**
+            # （实测：输出 ``{"properties": {...}}`` 而不是实例）—— 这不是
+            # 「关掉思考就一定更好」。本 agent 的解法是拿原始文本再解一次
+            # （见 _coerce_action 里那段说明）。另外 C 侧 thinking 是
+            # 「开了就锁住」的：per-call 的 False 本身不生效，必须由
+            # worker 的 ``set_thinking_mode`` 真的切一次。
             #
             # ``max_new_tokens=512``：这一步要的是一个动作 JSON，实测几百
             # token 以内。9B 的 spec 默认是 13312（= max_context_len // 8，
@@ -1036,7 +1037,34 @@ class ComputerControlAgent:
         if isinstance(result, AgentAction):
             # 也要过 0-1 换算 —— 见 _scale_0_1 的说明：校验通过不代表
             # 坐标就是 0-1000，而这条路径以前恰恰是漏掉换算的那条。
-            return self._scale_0_1(result.model_dump())
+            dumped = self._scale_0_1(result.model_dump())
+            if dumped.get("action"):
+                return dumped
+            # ⚠️ **实例里没有 action —— 模型复读了 schema 外壳。**
+            #
+            # 真机实测（9B，非思考模式）：模型把提示里的 JSON Schema
+            # **原样抄了回来**，只是把值填了进去：
+            #
+            #     ```json
+            #     {"properties": {"action": "key", "x": null, ...,
+            #                      "text": "notepad", "thought": "..."}}
+            #     ```
+            #
+            # 这个外壳不是合法的 AgentAction 实例，pydantic 校验失败 →
+            # wdnai 的 ``_safe_validate`` 把它降级成「只带 text 字段的
+            # 实例」→ ``model_dump()`` 里**根本没有 action 键**。
+            #
+            # 原来这里直接 return，调用方拿到一个没有动作的 dict，报
+            # 「不支持的动作: ''」，整轮电脑控制全废。而**真正的 JSON
+            # 还在** —— ``_ask_model`` 把原始文本存进了 ``self._last_raw``，
+            # 而且 ``_parse_action_json`` / ``_normalize_action`` 本来就
+            # 认识 ``{"properties": {...}}`` 这层外壳（只是原来走不到，
+            # 因为 wdnai 把原文吞了）。所以这里拿原文再解一次。
+            if self._last_raw:
+                got = _parse_action_json(self._last_raw, why)
+                if got is not None:
+                    return got
+            return dumped
         if isinstance(result, str):
             if not result.strip():
                 why.append("模型返回了空内容")

@@ -39,3 +39,28 @@ currently provides 1 card: `usb-hid` —— 把板子当成 PC 的 USB 外设
 - `src/wdnapps_hdmi_processor/cards/usb_hid/` — the card: `manifest.json` + `api.py` / `service.py` / `agent.py` + `static/`.
 - The host discovers the cards through the `wdnwebui.cards` entry point group —— `manifest.json` 是宿主装载的唯一契约。
 - `src/wdnapps_hdmi_processor/__init__.py` — the package version.
+
+### usb_hid agent：模型复读 JSON Schema 外壳时怎么活下来（2026-11-12）
+
+Qwen3.5-9B 在**真·非思考模式**下会**复读提示里的 JSON Schema 外壳** ——
+把 `model_json_schema()` 的结构原样抄回来，只把值填进去：
+
+```` ```json
+{"properties": {"action": "key", "x": null, …, "text": "notepad",
+                "thought": "…"}}
+``` ````
+
+这不是合法的 schema 实例 → pydantic 校验失败 → wdnai 的 `_safe_validate`
+把它降级成「**只带 `text` 字段的实例**」→ `model_dump()` 里**根本没有
+`action` 键** → agent 拿到一个没有动作的 dict，报「不支持的动作: ''」，
+整轮电脑控制全废。
+
+⇒ `_coerce_action` 在 `isinstance(result, AgentAction)` 这条分支上多了一步：
+**实例里没有 `action` 时，拿 `self._last_raw`（`on_delta` 收回的原始文本）
+再解析一次**。`_parse_action_json` / `_normalize_action` 本来就认识
+`{"properties": {...}}` 这层外壳（`_normalize_action` 里那句
+`if "action" not in body and isinstance(body.get("properties"), dict)`），
+只是原来**走不到** —— wdnai 把原文吞了，只留下一个残缺的实例。
+
+教训：**别信「`respond(generating=…)` 返回了 schema 实例」就等于解析成功。**
+校验失败时它可能是个只有 `text` 的空壳，真正的内容在原始文本里。
