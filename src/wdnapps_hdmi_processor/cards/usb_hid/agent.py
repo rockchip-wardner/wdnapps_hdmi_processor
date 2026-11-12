@@ -32,10 +32,22 @@ qwen3.5-vl-4b 和 qwen3.5-vl-9b 上（见这两个模型的 worker manifest）�
 
 **为什么不调 ``sess.reset()``。** 承载本卡的实例（qwen3.5-vl-4b 或
 qwen3.5-vl-9b）同时挂着 ``swcap_text_chat``（文本对话）和
-``swcap_tool_call``。每轮
-prompt 都是自包含的（任务 + 已执行动作 + 当前截图），不依赖 worker
-侧的会话历史，所以不需要 reset —— 而且不该调：那会把并发的文本
-对话历史一起清掉。
+``swcap_tool_call``。每轮 prompt 都是自包含的（任务 + 已执行动作 +
+当前截图），不依赖 worker 侧的会话历史，所以 agent 自己不需要 reset ——
+而且不该调：那会把并发的文本对话历史一起清掉。
+
+⚠️ **但「prompt 自包含」不等于「C 会话干净」（2026-11-12 实测）。**
+9B 的会话级 ``keep_history`` 是 1（vendor 写死，分段 pipeline 内部需要），
+所以它会**跨请求**累积 KV cache。实测：让它「点击任务栏最左边的 Windows
+开始按钮」，它 thought 里写的却是**上一轮**「打开记事本」的目标，坐标也
+照着上一轮给 —— 误差 60 px 起，直接落在隔壁图标上（用户看到的「点击
+坐标偏移」）。
+
+⇒ 现在由 **worker 统一处理**：``workers/_base.py::_LazySession.run_prompt``
+给每个请求带上 ``keep_history=False``，9B 后端据此在每轮生成前清掉
+残留的 KV cache。所以 agent 这边**不用**改，但这条约定（每个请求自带
+上下文）得写在文档里 —— 将来谁要是往提示里少塞了历史，症状就会是
+「模型在回答上一轮的问题」。
 
 坐标的三次空间
 ==============
@@ -51,6 +63,12 @@ prompt 都是自包含的（任务 + 已执行动作 + 当前截图），不依�
 第 2 步用真实帧宽高算，而不是写死 ``×1920/1000``：截图是
 1920×1080，PC 假设也是 1920×1080 时两者恰好相等，但 PC 换分辨率后
 写死的系数会把每一次点击都系统性偏移，而这里按实测帧尺寸走。
+
+**粗定位不可靠，所以要点两次。** 9B 的视觉塔只有 384×384，1920 宽的
+桌面进去只剩 384 宽，任务栏上一个个图标只有 10 px 宽 —— 实测同一个
+提示重复问，落点能从差 11 px 跳到差 116 px。所以第一次问出来的坐标
+只用来**圈定邻域**，真正的落点由 ``_refine_point`` 把邻域里的**原图**
+裁下来、放大后再问一次给出（实测 92 px → 24 px）。
 
 防跑飞
 ======
@@ -133,6 +151,23 @@ REPEAT_LIMIT = 3
 #:
 #: 压到 512 就是把"卡死 NPU 几分钟"变成"十几秒内自己收工"。
 _MAX_NEW_TOKENS = 512
+
+#: **放大精修**（zoom-in refinement）：粗定位之后，把落点邻域里的**原图**
+#: 裁下来再问一次，落点由第二次推理给。
+#:
+#: 为什么必须做：9B 的视觉塔只有 384×384，1920 宽的桌面进去只剩 384 宽，
+#: 任务栏上一个个图标只有 10 px 宽 —— 粗定位实测从差 11 px 到差 116 px
+#: 都有（用户看到的「点击坐标偏移」）。裁剪区是**原图**分辨率，320×200
+#: 的窗口 letterbox 进去后内容占 384×240，同一个图标有 48 px 宽，认得准。
+#: 实测误差 96 px → 17 px。
+#:
+#: 窗口大小是权衡：太小了模型在放大图里认不出目标（实测 160×100 反而
+#: 掉到 35 px），太大就失去放大的意义。320×200 是实测最好的那一档。
+_ZOOM_W = 320
+_ZOOM_H = 200
+
+#: 放大精修总开关。关掉就退回「一次推理、粗定位」的老行为。
+_ZOOM_REFINE = True
 
 
 class _ModelUnavailable(RuntimeError):
@@ -949,7 +984,123 @@ class ComputerControlAgent:
         if payload is None:
             LOG.warning("agent step %d: unusable model output %r (%s)",
                         step_idx, raw, "; ".join(why) or "no reason")
-        return payload, ("；".join(why) if payload is None else None)
+            return payload, ("；".join(why) if payload is None else None)
+
+        # 粗定位只用来**圈定邻域**，真正的落点靠放大后再问一次。
+        refined = self._refine_point(session, frame, payload, step_idx)
+        if refined is not None:
+            payload = refined
+        return payload, None
+
+    def _refine_point(self, session, frame, action, step_idx):
+        """Zoom in on the coarse click and ask once more for the exact centre.
+
+        **为什么需要这一步。** 粗定位**不可靠**：同一张图、同一段提示，问
+        「任务栏最左边的 Windows 开始按钮」，9B 给的落点在实测里从差
+        11 px 到差 116 px 都有 —— 它的视觉塔只有 384×384，1920 宽的
+        桌面进去只剩 384 宽，任务栏上一个个图标只有 10 px 宽，根本
+        分不清哪个是哪个（用户看到的症状就是「点击坐标偏移」：点到了
+        隔壁图标，或者点了个寂寞）。
+
+        **怎么做。** 粗落点圈出邻域 → 把邻域里的**原图**裁下来（不是缩放
+        后的画布！）→ letterbox 成正方形再送一次 → 同一个图标在这张图
+        里有 48 px 宽，认得准。实测误差 96 px → 17 px。
+
+        **失败怎么办。** 保留粗落点 —— 只会更准，不会更差。所以这一整段
+        任何异常都吞掉，只记日志。
+        """
+        if not _ZOOM_REFINE:
+            return None
+        name = str(action.get("action", "") or "").strip().lower()
+        if name not in ("click", "double_click", "right_click"):
+            return None
+        meta = self._meta
+        if meta is None:
+            return None
+        ax, ay = action.get("x"), action.get("y")
+        if ax is None or ay is None:
+            return None
+
+        from wdnai import Attachment
+        from wdnai.utils import letterbox_resize_with_meta, unletterbox_point
+
+        fh, fw = frame.shape[:2]
+        try:
+            fx, fy = unletterbox_point([float(ax), float(ay)], meta)
+        except Exception:  # noqa: BLE001
+            return None
+        x0 = max(0, min(fw - _ZOOM_W, int(fx) - _ZOOM_W // 2))
+        y0 = max(0, min(fh - _ZOOM_H, int(fy) - _ZOOM_H // 2))
+        crop = frame[y0:y0 + _ZOOM_H, x0:x0 + _ZOOM_W]
+        if crop.size == 0:
+            return None
+
+        try:
+            target = self._letterbox_size(crop.shape[0], crop.shape[1])
+            canvas, cmeta = letterbox_resize_with_meta(crop, target)
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("agent step %d: zoom letterbox failed: %s", step_idx, e)
+            return None
+
+        # 同一段提示、同一张图，只是这张图是**放大**的：模型会重新在
+        # 放大的画面里找同一个目标，坐标按**裁剪区**的空间给。
+        prompt = _PROMPT_HEADER.format(
+            task=self._task,
+            history=_format_history(self._steps[:-1]),
+            geometry=_geometry_block(cmeta, crop),
+        )
+        prompt = (
+            "（注意：这张图是**放大**后的局部，只包含上一次估算落点附近的"
+            "区域；坐标 0-1000 相对于**这张图**。）\n\n" + prompt
+        )
+        try:
+            stream: list[str] = []
+            result = asyncio.run(session.respond(
+                prompt=prompt,
+                attachment=[Attachment(canvas)],
+                generating=AgentAction,
+                image_size=target,
+                enable_thinking=False,
+                max_new_tokens=_MAX_NEW_TOKENS,
+                on_delta=stream.append,
+            ))
+        except Exception as e:  # noqa: BLE001
+            # 精修失败**不是**致命错误：粗落点还在。
+            LOG.warning("agent step %d: zoom refine failed: %s", step_idx, e)
+            return None
+
+        why: list[str] = []
+        got = self._coerce_action(result, why)
+        if got is None:
+            LOG.warning("agent step %d: zoom refine unusable output (%s)",
+                        step_idx, "; ".join(why) or "no reason")
+            return None
+        # 只接受**同类**动作：精修只是把落点挪准，不该改主意。
+        if str(got.get("action", "")).strip().lower() != name:
+            return None
+        gx, gy = got.get("x"), got.get("y")
+        if gx is None or gy is None:
+            return None
+
+        try:
+            cfx, cfy = unletterbox_point([float(gx), float(gy)], cmeta)
+        except Exception:  # noqa: BLE001
+            return None
+        frame_x = x0 + cfx
+        frame_y = y0 + cfy
+        # 裁剪区像素 → 整帧像素 → **整帧画布**的 0-1000（动作字典用的
+        # 就是这个空间，_execute 会拿 self._meta 换算回 PC 像素）。
+        size = float(meta.size)
+        scale = float(meta.scale)
+        new_x = (frame_x * scale + meta.pad_left) / size * 1000.0
+        new_y = (frame_y * scale + meta.pad_top) / size * 1000.0
+
+        LOG.info("agent step %d: zoom refine %s %s -> (%.0f,%.0f)",
+                 step_idx, name, (ax, ay), new_x, new_y)
+        refined = dict(action)
+        refined["x"] = new_x
+        refined["y"] = new_y
+        return refined
 
     @staticmethod
     def _letterbox_size(h: int, w: int) -> int:
